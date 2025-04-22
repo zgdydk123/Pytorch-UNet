@@ -11,6 +11,7 @@ from torchvision import transforms
 from utils.data_loading import BasicDataset
 from unet import UNet
 from utils.utils import plot_img_and_mask
+from utils.utils import compute_optical_flow
 
 def predict_img(net,
                 full_img,
@@ -18,13 +19,13 @@ def predict_img(net,
                 scale_factor=1,
                 out_threshold=0.5):
     net.eval()
-    img = torch.from_numpy(BasicDataset.preprocess(None, full_img, scale_factor, is_mask=False))
+    img = torch.from_numpy(full_img)
     img = img.unsqueeze(0)
     img = img.to(device=device, dtype=torch.float32)
 
     with torch.no_grad():
         output = net(img).cpu()
-        output = F.interpolate(output, (full_img.size[1], full_img.size[0]), mode='bilinear')
+        # output = F.interpolate(output, (full_img.shape[1], full_img.shape[0]), mode='bilinear')
         if net.n_classes > 1:
             mask = output.argmax(dim=1)
         else:
@@ -75,6 +76,22 @@ def mask_to_image(mask: np.ndarray, mask_values):
 
     return Image.fromarray(out)
 
+def get_previous_frame_name(current_name):
+    # Example: current_name = 'frame_000001.png'
+    prefix, number_ext = current_name.split('_')  # ['frame', '000001.png']
+    number_str, ext = number_ext.split('.')       # ['000001', 'png']
+
+    number = int(number_str)
+    prev_number = max(0, number - 1)  # avoid negative frame number
+
+    # Format it back to 6 digits with leading zeros
+    prev_number_str = f'{prev_number:06d}'
+
+    # Rebuild previous frame name
+    prev_name = f'{prefix}_{prev_number_str}.{ext}'
+
+    return prev_name
+
 
 if __name__ == '__main__':
     args = get_args()
@@ -83,7 +100,7 @@ if __name__ == '__main__':
     in_files = args.input
     out_files = get_output_filenames(args)
 
-    net = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    net = UNet(n_channels=2, n_classes=args.classes, bilinear=args.bilinear)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Loading model {args.model}')
@@ -98,10 +115,21 @@ if __name__ == '__main__':
 
     for i, filename in enumerate(in_files):
         logging.info(f'Predicting image {filename} ...')
-        img = Image.open(filename)
+        prev_filename = get_previous_frame_name(filename)
+        img = Image.open(filename).convert('L')
+        prev_img= Image.open(prev_filename).convert('L')
+
+        img_np = np.array(img)
+        prev_img_np = np.array(prev_img)
+        # Compute flow
+        _, flow_magnitude = compute_optical_flow(img_np, prev_img_np)
+        flow_magnitude = flow_magnitude / (np.max(flow_magnitude) + 1e-8)
+        img_np = img_np.astype(np.float32) / 255.0  # Normalize grayscale image
+        # Stack [img, flow]
+        input_tensor = np.stack([img, flow_magnitude], axis=0)
 
         mask = predict_img(net=net,
-                           full_img=img,
+                           full_img=input_tensor,
                            scale_factor=args.scale,
                            out_threshold=args.mask_threshold,
                            device=device)

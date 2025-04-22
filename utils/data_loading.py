@@ -11,8 +11,7 @@ from os.path import splitext, isfile, join
 from pathlib import Path
 from torch.utils.data import Dataset
 from tqdm import tqdm
-
-
+from utils.utils import compute_optical_flow
 def load_image(filename):
     ext = splitext(filename)[1]
     if ext == '.npy':
@@ -20,7 +19,7 @@ def load_image(filename):
     elif ext in ['.pt', '.pth']:
         return Image.fromarray(torch.load(filename).numpy())
     else:
-        return Image.open(filename)
+        return Image.open(filename).convert('L')
 
 
 def unique_mask_values(idx, mask_dir, mask_suffix):
@@ -91,23 +90,45 @@ class BasicDataset(Dataset):
             return img
 
     def __getitem__(self, idx):
-        name = self.ids[idx]
+        current_id = self.ids[idx]
+        if idx == 0:
+            prev_id = self.ids[idx]  # duplicate first frame
+        else:
+            prev_id = self.ids[idx - 1]
+
+        name = current_id
         mask_file = list(self.mask_dir.glob(name + self.mask_suffix + '.*'))
         img_file = list(self.images_dir.glob(name + '.*'))
+
+        prev_name = prev_id
+        prev_img_file = list(self.images_dir.glob(prev_name + '.*'))
 
         assert len(img_file) == 1, f'Either no image or multiple images found for the ID {name}: {img_file}'
         assert len(mask_file) == 1, f'Either no mask or multiple masks found for the ID {name}: {mask_file}'
         mask = load_image(mask_file[0])
         img = load_image(img_file[0])
+        prev_img = load_image(prev_img_file[0])
+
+        img_np = np.array(img)
+        prev_img_np = np.array(prev_img)
+        # Compute flow
+        _, flow_magnitude = compute_optical_flow(img_np, prev_img_np)
+        flow_magnitude = flow_magnitude / (np.max(flow_magnitude) + 1e-8)
+        img_np = img_np.astype(np.float32) / 255.0  # Normalize grayscale image
+        # Stack [img, flow]
+        input_tensor = np.stack([img, flow_magnitude], axis=0)
 
         assert img.size == mask.size, \
             f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
-
-        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
+        
+        # img = self.preprocess(self.mask_values, input_tensor, self.scale, is_mask=False)
         mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
+        # prev_img = img = self.preprocess(self.mask_values, prev_img, self.scale, is_mask=False)
+
+
 
         return {
-            'image': torch.as_tensor(img.copy()).float().contiguous(),
+            'image': torch.as_tensor(input_tensor.copy()).float().contiguous(),
             'mask': torch.as_tensor(mask.copy()).long().contiguous()
         }
 
@@ -115,3 +136,51 @@ class BasicDataset(Dataset):
 class CarvanaDataset(BasicDataset):
     def __init__(self, images_dir, mask_dir, scale=1):
         super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
+
+
+from pathlib import Path
+import numpy as np
+from PIL import Image
+import torch
+from torch.utils.data import Dataset
+import cv2
+
+class OpticalFlowDataset(Dataset):
+    def __init__(self, image_dir, mask_dir, transform=None):
+        self.image_dir = Path(image_dir)
+        self.mask_dir = Path(mask_dir)
+        self.ids = sorted([p.stem for p in self.image_dir.glob('*.png')])
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, i):
+        current_id = self.ids[i]
+        if i == 0:
+            prev_id = self.ids[i]  # duplicate first frame
+        else:
+            prev_id = self.ids[i - 1]
+
+        img_path = self.image_dir / f'{current_id}.png'
+        prev_path = self.image_dir / f'{prev_id}.png'
+        mask_path = self.mask_dir / f'{current_id}.png'
+
+        # Load grayscale images
+        img = np.array(Image.open(img_path).convert('L'))
+        prev_img = np.array(Image.open(prev_path).convert('L'))
+        mask = np.array(Image.open(mask_path).convert('L'))
+
+        # Compute flow
+        _, flow_magnitude = compute_optical_flow(prev_img, img)
+
+        # Normalize inputs
+        img = img.astype(np.float32) / 255.0
+        flow_magnitude = flow_magnitude.astype(np.float32)
+        flow_magnitude /= np.max(flow_magnitude) + 1e-8
+
+        # Stack [img, flow]
+        input_tensor = np.stack([img, flow_magnitude], axis=0)
+        mask_tensor = torch.from_numpy(mask).long()  # or float if binary
+
+        return torch.from_numpy(input_tensor), mask_tensor
